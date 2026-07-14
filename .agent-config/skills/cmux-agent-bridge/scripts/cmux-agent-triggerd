@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+
+from cmux_agent_common import (
+    DELIVERED_PATH,
+    LOG_PATH,
+    QUEUE_PATH,
+    ensure_state_dir,
+    format_prompt,
+    inject,
+    load_state,
+    log,
+    now_iso,
+    read_surface,
+    resolve_agent_surface,
+    run_cmux,
+    surface_ready,
+)
+
+# How long to wait between readiness re-checks of the SAME pending message.
+# The daemon should be patient — a busy agent needs time to think, and
+# rechecking every poll tick (every couple seconds) just spams the log with
+# "terminal appears busy" without changing anything. Only escalate after a
+# real while.
+PATIENCE_SECONDS = 20.0
+
+# If a message has been pending longer than this, something may be actually
+# stuck rather than just busy — most often: `inject()` sent the prompt text
+# but the follow-up Enter keypress was dropped, so the message sits typed
+# but never submitted. Past this threshold we try one recovery nudge
+# (resend Enter) before going back to patient waiting.
+STUCK_SECONDS = 240.0
+
+# id -> {"first_seen": ts, "last_checked": ts, "recovery_attempted": bool}
+_pending_state: dict[str, dict] = {}
+
+
+def read_queue() -> list[dict]:
+    if not QUEUE_PATH.exists():
+        return []
+    rows = []
+    with QUEUE_PATH.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                rows.append(json.loads(line))
+    return rows
+
+
+def read_delivered_ids() -> set[str]:
+    if not DELIVERED_PATH.exists():
+        return set()
+    ids: set[str] = set()
+    with DELIVERED_PATH.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if line:
+                ids.add(json.loads(line)["id"])
+    return ids
+
+
+def append_delivered(row: dict, surface: str) -> None:
+    ensure_state_dir()
+    with DELIVERED_PATH.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps({**row, "delivered_at": now_iso(), "surface": surface, "mode": "queue"}, separators=(",", ":")) + "\n")
+
+
+def process_once(force: bool = False) -> int:
+    state = load_state()
+    delivered = read_delivered_ids()
+    count = 0
+    now = time.time()
+    live_ids = set()
+    for row in read_queue():
+        mid = row["id"]
+        if mid in delivered:
+            continue
+        live_ids.add(mid)
+        meta = _pending_state.setdefault(mid, {"first_seen": now, "last_checked": 0.0, "recovery_attempted": False})
+
+        # Patience: don't re-check the same pending message's readiness more
+        # than once per PATIENCE_SECONDS. Newly-queued messages (last_checked
+        # still 0) are always checked immediately.
+        if not force and meta["last_checked"] and (now - meta["last_checked"]) < PATIENCE_SECONDS:
+            continue
+        meta["last_checked"] = now
+
+        try:
+            surface = resolve_agent_surface(state, row["to"])
+            read_surface(surface)
+            ready, reason = surface_ready(row["to"], surface)
+            if not ready and not force:
+                pending_for = now - meta["first_seen"]
+                if pending_for > STUCK_SECONDS and not meta["recovery_attempted"]:
+                    meta["recovery_attempted"] = True
+                    log(
+                        f"stuck-recovery id={mid} to={row['to']} surface={surface} "
+                        f"pending_for={int(pending_for)}s reason={reason} — "
+                        "resending Enter in case the prior injection's keypress was dropped"
+                    )
+                    run_cmux(["send-key", "--surface", surface, "Enter"])
+                    continue
+                log(f"retry-later id={mid} to={row['to']} surface={surface} reason={reason}")
+                continue
+            inject(surface, format_prompt(row))
+            append_delivered(row, surface)
+            delivered.add(mid)
+            count += 1
+            log(f"delivered id={mid} to={row['to']} surface={surface}")
+        except Exception as error:
+            log(f"delivery-failed id={mid} to={row.get('to')} error={type(error).__name__}: {error}")
+
+    # Drop tracking state for messages no longer in the queue (delivered or removed).
+    for stale_id in list(_pending_state):
+        if stale_id not in live_ids:
+            _pending_state.pop(stale_id, None)
+
+    return count
+
+
+def status() -> int:
+    print(f"queue_path={QUEUE_PATH}")
+    print(f"delivered_path={DELIVERED_PATH}")
+    print(f"log_path={LOG_PATH}")
+    print(f"queued={len(read_queue())}")
+    print(f"delivered={len(read_delivered_ids())}")
+    if LOG_PATH.exists():
+        print("last_log_lines:")
+        print("\n".join(LOG_PATH.read_text(encoding="utf-8", errors="replace").splitlines()[-20:]))
+    return 0
+
+
+def main() -> int:
+    global PATIENCE_SECONDS, STUCK_SECONDS
+    parser = argparse.ArgumentParser(description="Deliver queued CMUX agent handoffs.")
+    parser.add_argument("--once", action="store_true")
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument("--poll-seconds", type=float, default=2.0)
+    parser.add_argument(
+        "--patience-seconds",
+        type=float,
+        default=PATIENCE_SECONDS,
+        help="Minimum gap between readiness re-checks of the same pending message (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--stuck-seconds",
+        type=float,
+        default=STUCK_SECONDS,
+        help="Pending time after which to attempt stuck-recovery (resend Enter) once (default: %(default)s).",
+    )
+    args = parser.parse_args()
+
+    PATIENCE_SECONDS = args.patience_seconds
+    STUCK_SECONDS = args.stuck_seconds
+
+    ensure_state_dir()
+    if args.status:
+        return status()
+
+    log(f"starting cmux-agent-triggerd once={args.once}")
+    while True:
+        delivered = process_once(force=args.force)
+        if delivered:
+            log(f"processed {delivered} queued message(s)")
+        if args.once:
+            return 0
+        time.sleep(args.poll_seconds)
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        raise SystemExit(130)
+    except RuntimeError as error:
+        print(str(error), file=sys.stderr)
+        raise SystemExit(1)
